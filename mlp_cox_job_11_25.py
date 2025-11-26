@@ -30,6 +30,16 @@ import pycox
 from filelock import FileLock
 from optuna.trial import TrialState
 
+
+from lifelines import KaplanMeierFitter
+from sklearn.metrics import (
+    average_precision_score,
+    precision_recall_curve,
+    roc_auc_score,
+    roc_curve,
+)
+
+
 PRELOADED_DATA = None
 # ------------------------------  constants / paths
 EVENT_KEYS = ["afe","ale","hit","mxe","se","ri","a5ss","a3ss"]
@@ -94,6 +104,90 @@ def apply_zscore_inplace(x: torch.Tensor, idx: torch.Tensor, mu, sigma):
     In-place z-score on x[:, idx] using provided mu, sigma.
     """
     x[:, idx] = (x[:, idx] - mu) / sigma
+
+
+def _binary_ranking_metrics(y_true: np.ndarray,
+                            scores: np.ndarray,
+                            prefix: str,
+                            out_dir: str) -> Dict[str, float]:
+    """
+    Compute ROC AUC / PR AUC and write full curves to CSV.
+    Catches degenerate label sets (all 0 or all 1) and returns NaN metrics.
+    """
+    metrics = {}
+
+    # ROC -------------------------------------------------------------
+    try:
+        auc = roc_auc_score(y_true, scores)
+        fpr, tpr, thr = roc_curve(y_true, scores)
+        pd.DataFrame({
+            "fpr": fpr,
+            "tpr": tpr,
+            "threshold": thr,
+        }).to_csv(f"{out_dir}/{prefix}_roc_curve.csv", index=False)
+    except ValueError:
+        auc = float("nan")
+    metrics[f"{prefix}_roc_auc"] = float(auc)
+
+    # PR --------------------------------------------------------------
+    try:
+        ap = average_precision_score(y_true, scores)
+        pr_p, pr_r, pr_thr = precision_recall_curve(y_true, scores)
+        # precision_recall_curve returns thresholds of len(n_points - 1)
+        thr_pad = np.concatenate([pr_thr, [np.nan]])
+        pd.DataFrame({
+            "precision": pr_p,
+            "recall": pr_r,
+            "threshold": thr_pad,
+        }).to_csv(f"{out_dir}/{prefix}_pr_curve.csv", index=False)
+    except ValueError:
+        ap = float("nan")
+    metrics[f"{prefix}_avg_precision"] = float(ap)
+
+    return metrics
+
+
+def _km_by_risk_quantile(risk: np.ndarray,
+                         t: np.ndarray,
+                         e: np.ndarray,
+                         prefix: str,
+                         out_dir: str,
+                         q: int = 4) -> pd.DataFrame:
+    """
+    Save per-quantile Kaplan–Meier survival tables + summary stats.
+    Falls back to equal-width bins if q-quantiles are not unique.
+    """
+    risk_series = pd.Series(risk, name="risk")
+    try:
+        bins = pd.qcut(risk_series, q=q, labels=False, duplicates="drop")
+    except ValueError:
+        bins = pd.cut(risk_series, bins=q, labels=False)
+
+    km = KaplanMeierFitter()
+    rows = []
+    for g in sorted(np.unique(bins.dropna().astype(int))):
+        mask = bins == g
+        if mask.sum() == 0:
+            continue
+        km.fit(t[mask], e[mask])
+        surv = km.survival_function_.reset_index()
+        surv.columns = ["time", "survival"]
+        surv.to_csv(f"{out_dir}/{prefix}_km_q{g+1}.csv", index=False)
+
+        rows.append({
+            "quantile": int(g + 1),
+            "n": int(mask.sum()),
+            "events": int(e[mask].sum()),
+            "median_survival": float(km.median_survival_time_),
+            "risk_min": float(risk[mask].min()),
+            "risk_max": float(risk[mask].max()),
+            "risk_mean": float(risk[mask].mean()),
+        })
+
+    summary = pd.DataFrame(rows)
+    summary.to_csv(f"{out_dir}/{prefix}_km_summary.csv", index=False)
+    return summary
+
 
 def train_val_test_split(X, t, e, test_size=0.3, seed=42):
     """
@@ -240,10 +334,12 @@ def load_omics(cancer_code: int,
     keep = (~np.isnan(X).any(1)) & ~np.isnan(t) & ~np.isnan(e)
     X, t, e = X[keep], t[keep], e[keep]
 
+    sample_ids = clin.index.values[keep]
     return (torch.tensor(X, dtype=torch.float32),
             torch.tensor(t, dtype=torch.float32),
             torch.tensor(e, dtype=torch.float32),
-            names)
+            names,
+            sample_ids)
 
 
 def _strat_labels(t: torch.Tensor, e: torch.Tensor, n_q: int = 4) -> np.ndarray:
@@ -501,7 +597,7 @@ def train_once(
         )
 
         best_c = -np.inf
-        patience = 50
+        patience = 100
         stall = 0
 
         for ep in range(1, cfg["epochs"] + 1):
@@ -553,7 +649,7 @@ def objective(trial, X, t, e, feat_names, modality, transform_data):
         "drop"   : trial.suggest_float("drop", 0.1, 0.8),
         "lr"     : trial.suggest_float("lr", 1e-5, 1e-3, log=True),
         "wd"     : trial.suggest_float("wd", 1e-6, 1e-3, log=True),
-        "epochs" : trial.suggest_categorical("epochs", [100, 200, 300, 400, 500, 750, 1000]),
+        "epochs" : trial.suggest_categorical("epochs", [100, 200, 300, 400, 500, 750, 1000, 1250]),
     }
     return train_once(X, t, e, feat_names, cfg, modality, transform_data)
 
@@ -657,10 +753,10 @@ def fit_full(
     n_events_val = int(e_val.sum().item())
     print("VAL events:", n_events_val)
     n_events_train = int(e_train.sum().item())
-    print("VAL events:", n_events_train)
+    print("TRAIN events:", n_events_train)
 
     len_val = len(e_val)
-    print("TRAIN total:", len_val)
+    print("VAL total:", len_val)
     len_train = len(e_train)
     print("TRAIN total:", len_train)
 
@@ -673,7 +769,7 @@ def fit_full(
     best_val_c = -float("inf")
     best_state = None
     stall      = 0
-    patience   = 50
+    patience   = 100
 
     train_losses, val_losses = [], []
     train_cidxs, val_cidxs   = [], []
@@ -738,36 +834,145 @@ def fit_full(
             print(f"[EARLY STOP] Stopping at epoch {ep+1}, best val C={best_val_c:.4f}")
             break
 
-        # --- plot loss + C-index curves ----------------------------------------
-        plt.figure()
-        plt.plot(train_losses, label="Train")
-        plt.plot(val_losses,   label="Val")
-        plt.xlabel("Epochs")
-        plt.ylabel("Cox PH Loss")
-        plt.legend()
-        plt.title("Train vs Val Loss")
-        plt.savefig(f"{model_dir}/loss_curve.png", dpi=150, bbox_inches="tight")
-        plt.close()
+    # --- plot loss + C-index curves ----------------------------------------
+    plt.figure()
+    plt.plot(train_losses, label="Train")
+    plt.plot(val_losses,   label="Val")
+    plt.xlabel("Epochs")
+    plt.ylabel("Cox PH Loss")
+    plt.legend()
+    plt.title("Train vs Val Loss")
+    plt.savefig(f"{model_dir}/loss_curve.png", dpi=150, bbox_inches="tight")
+    plt.close()
 
-        plt.figure()
-        plt.plot(train_cidxs, label="Train")
-        plt.plot(val_cidxs,   label="Val")
-        plt.xlabel("Epochs")
-        plt.ylabel("Concordance Index")
-        plt.ylim(0.4, 1.0)
-        plt.legend()
-        plt.title("Train vs Val C-index")
-        plt.savefig(f"{model_dir}/cidx_curve.png", dpi=150, bbox_inches="tight")
-        plt.close()
+    plt.figure()
+    plt.plot(train_cidxs, label="Train")
+    plt.plot(val_cidxs,   label="Val")
+    plt.xlabel("Epochs")
+    plt.ylabel("Concordance Index")
+    plt.ylim(0.4, 1.0)
+    plt.legend()
+    plt.title("Train vs Val C-index")
+    plt.savefig(f"{model_dir}/cidx_curve.png", dpi=150, bbox_inches="tight")
+    plt.close()
 
         # --- load best weights --------------------------------------------------
-        if best_state is not None:
-            net.load_state_dict(best_state)
-        else:
-            print("[WARN] best_state is None; using final epoch weights")
+    if best_state is not None:
+        net.load_state_dict(best_state)
+    else:
+        print("[WARN] best_state is None; using final epoch weights")
 
     # IMPORTANT: return mu, sigma on CPU so they can be reused on X_test, SHAP, etc.
     return net, mu_cpu, sigma_cpu
+
+def run_shap(
+    best_net: nn.Module,
+    mu,
+    sigma,
+    X: torch.Tensor,
+    feat_names: List[str],
+    out_dir: str,
+    sample_ids,
+    nsamples: int = 200,
+    background_size: int = 200,
+    seed: int = SEED,
+):
+    """
+    DeepExplainer with a *fixed* risk baseline
+    -----------------------------------------
+    • Pick `background_size` random samples         → X_back
+    • Baseline µ = mean( risk(X_back) )
+    • Explain the first `nsamples` samples          → X_expl
+    The wrapper returns  r(x) − µ, so every SHAP value
+    reflects deviation from that population-average risk.
+    """
+    ## max out for speed and csv output
+    nsamples = min(int(nsamples), 1000)
+    background_size = min(int(background_size), 1000)
+
+    best_net.eval()
+    device = next(best_net.parameters()).device
+
+    # 1 ─── choose background + foreground ---------------------------------
+    rng = np.random.default_rng(seed)
+    bg_idx = rng.choice(len(X), size=min(background_size, len(X)), replace=False)
+    fg_idx = np.arange(min(nsamples, len(X)))
+
+    X_back = X[bg_idx].to(device)
+    X_expl = X[fg_idx].to(device)
+
+    # 2 ─── compute global baseline µ --------------------------------------
+    with torch.no_grad():
+        mu = best_net(X_back).mean().item()        # scalar baseline
+
+    # 3 ─── wrapper that subtracts µ (NOT per-batch mean) ------------------
+    class RiskShift(nn.Module):
+        def __init__(self, base, mu):
+            super().__init__()
+            self.base, self.mu = base, mu
+
+        def forward(self, x):
+            r = self.base(x).unsqueeze(1)          # shape (B,1)
+            return r - self.mu                     # fixed shift
+
+    wrapped = RiskShift(best_net, mu).to(device)
+
+    # 4 ─── run DeepExplainer (additivity check off) -----------------------
+    explainer = shap.DeepExplainer(wrapped, X_back)
+    sv = explainer.shap_values(X_expl, check_additivity=False)
+
+    # Normalize output shapes from DeepExplainer so downstream plotting
+    # always receives a 2-D (N, D) matrix of SHAP values.
+    if isinstance(sv, list):
+        sv = sv[0]
+    if isinstance(sv, torch.Tensor):
+        sv = sv.detach().cpu().numpy()
+
+    # squeeze any singleton output dimension regardless of position
+    if sv.ndim == 3:
+        if sv.shape[-1] == 1:
+            sv = sv[..., 0]
+        elif sv.shape[0] == 1:
+            sv = sv[0]
+        elif sv.shape[1] == 1:
+            sv = sv[:, 0, :]
+
+    if sv.ndim != 2:
+        raise RuntimeError(
+            f"Unexpected SHAP shape {sv.shape}; expected (N, D) after squeezing singleton outputs"
+        )
+
+    # 5 ─── save + plot ----------------------------------------------------
+    os.makedirs(out_dir, exist_ok=True)
+    np.save(f"{out_dir}/shap_values.npy", sv)
+
+    fg_sample_ids = [sample_ids[i] for i in fg_idx]
+    shap_df = pd.DataFrame(sv, 
+                           index = fg_sample_ids,
+                           columns=feat_names).T
+    shap_df.index.name = "feature"
+    shap_df.to_csv(f"{out_dir}/shap_values.csv")
+
+    print(sv.shape)
+    fig = plt.figure(figsize=(15, 15))
+    shap.summary_plot(
+        sv,
+        X_expl.cpu().numpy(),
+        feature_names=feat_names,
+        max_display=20,
+        show=False
+    )
+    fig.tight_layout()
+    plt.savefig(f"{out_dir}/summary_beeswarm.png",
+                dpi=200, bbox_inches="tight")
+    plt.close()
+
+    mean_abs = np.abs(sv).mean(0).reshape(-1)
+    pd.Series(mean_abs, index=feat_names) \
+      .sort_values(ascending=False) \
+      .to_csv(f"{out_dir}/shap_mean_abs.csv")
+
+
 
 def main():
 
@@ -821,13 +1026,10 @@ def main():
         cancer_code = project_map[args.cancer]
         if args.use_preloaded:
             assert PRELOADED_DATA is not None, "PRELOADED_DATA is empty!"
-            X, t, e, feat_names = PRELOADED_DATA
+            X, t, e, feat_names, sample_ids = PRELOADED_DATA
             print("[INFO] Using tensors from PRELOADED_DATA")
         else:
-            X, t, e, feat_names = load_omics(cancer_code,
-                                             args.modality,
-                                             with_clin=args.with_clin,
-                                             transform_data = args.transform_data)
+            X, t, e, feat_names, sample_ids = load_omics(cancer_code, args.modality, with_clin=args.with_clin, transform_data = args.transform_data)
             
         
     
@@ -899,11 +1101,11 @@ def main():
     
             best_params = {
                 "layers": 3,
-                "width": 128,
-                "drop": 0.15,
-                "lr": 1e-2,
+                "width": 512,
+                "drop": 0.1,
+                "lr": 5e-3,
                 "wd": 1e-3,
-                "epochs": 100,
+                "epochs": 50,
             }
             best_cfg = best_params
             print("Best hyper-params:", best_cfg)
@@ -914,6 +1116,106 @@ def main():
         print(f"[INFO] Samples={len(X_test)+len(X_dev)}, Features={X_dev.shape[1]}")
 
         best_net, mu, sigma = fit_full(X_dev, t_dev, e_dev, feat_names, best_cfg, args.modality, model_dir, args.transform_data)
+
+        best_net.eval()
+        non_clin_idx = torch.tensor(
+            [i for i, n in enumerate(feat_names)
+             if (not n.startswith("clin::")) or (n == "clin::age")],
+            dtype=torch.long
+        )
+        X_dev_scaled  = X_dev.clone()
+        X_test_scaled = X_test.clone()
+        
+        apply_zscore_inplace(X_dev_scaled,  non_clin_idx, mu, sigma)
+        apply_zscore_inplace(X_test_scaled, non_clin_idx, mu, sigma)    
+        
+        best_net.eval()
+
+        with torch.no_grad():
+            risk_dev  = best_net(X_dev_scaled.to(DEVICE)).cpu()
+            risk_test = best_net(X_test_scaled.to(DEVICE)).cpu()
+
+        c_dev = concordance_index(
+            t_dev.detach().cpu().numpy(),
+            -risk_dev.detach().cpu().numpy(),
+            e_dev.detach().cpu().numpy(),
+        )
+        c_test = concordance_index(
+            t_test.detach().cpu().numpy(),
+            -risk_test.detach().cpu().numpy(),
+            e_test.detach().cpu().numpy(),
+        )
+
+        print(f"[C-INDEX] Dev={c_dev:.3f} | Test={c_test:.3f}")
+    
+        risk_df = pd.DataFrame({
+            "risk": risk_test.numpy(),
+            "OS.time": t_test.numpy(),
+            "OS.event": e_test.numpy()
+        })
+        risk_df.to_csv(f"{model_dir}/risk_test.csv", index=False)
+        
+        
+        os.makedirs(model_dir, exist_ok=True)
+        torch.save(best_net.state_dict(),
+                   f"{ROOT_DIR}/models/{args.cancer}/{args.modality}/best_model.pt")
+        model_path = f"{model_dir}/best_model.pt"
+    
+        np.save(f"{model_dir}/risk_scores.npy", risk_test.numpy())
+    
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        meta = {
+            "timestamp" : stamp,
+            "cancer"    : args.cancer,
+            "modality"  : args.modality,
+            "dev_cidx"  : round(best_score_dev, 4),
+            "test_cidx" : round(c_test, 4),
+            "params"    : best_cfg,
+            "model_pt"  : model_path,
+            "feat_names": feat_names,
+            "non_clin_idx": non_clin_idx.detach().cpu().numpy().tolist(),
+            "mu"        : mu.detach().cpu().numpy().tolist(),
+            "sigma"     : sigma.detach().cpu().numpy().tolist(),
+
+        }
+    
+        json_path = f"{model_dir}/metrics.json"
+        with open(json_path, "w") as jf:
+            json.dump(meta, jf, indent=2)
+        
+        # 3) append to global CSV ledger
+        ledger = f"{model_dir}/run_summary.csv"
+        first  = not os.path.exists(ledger)
+        with open(ledger, "a", newline="") as f:
+            writer = csv.writer(f)
+            if first:
+                writer.writerow(["timestamp","cancer","modality",
+                                 "dev_cidx","test_cidx","model_path"])
+            writer.writerow([stamp, args.cancer, args.modality,
+                             f"{best_score_dev:.4f}", f"{c_test:.4f}", model_path])
+        
+        print(f"[SAVE] model → {model_path}")
+        print(f"[SAVE] metrics→ {json_path}")
+        print(f"[APPEND] ledger→ {ledger}")
+        out_dir = f"{ROOT_DIR}/shap/{args.cancer}/{args.modality}"
+        os.makedirs(out_dir, exist_ok=True)
+
+
+        # ------------------  SHAP ---------------------------------
+        out_dir = f"{ROOT_DIR}/shap/{args.cancer}/{args.modality}"
+        os.makedirs(out_dir, exist_ok=True)
+
+        X_scaled = X.clone()
+
+        apply_zscore_inplace(X_scaled, non_clin_idx, mu, sigma)
+        feat_names = [feat_names[i] for i in feat_idx.tolist()]
+
+        run_shap(best_net, mu, sigma, X_scaled[:, feat_idx], feat_names, out_dir, sample_ids, 100, 100)#X.shape[0], X.shape[0])
+
+        print(f"[DONE] {args.cancer}-{args.modality}  meanC={c_test:.3f}")
+        _append_status(args.cancer, args.modality, "Completed")
+    
+
     except Exception as ex:
         _append_status(args.cancer, args.modality,
                        f"Terminated: {type(ex).__name__}")
