@@ -125,6 +125,20 @@ def _binary_ranking_metrics(y_true: np.ndarray,
             "tpr": tpr,
             "threshold": thr,
         }).to_csv(f"{out_dir}/{prefix}_roc_curve.csv", index=False)
+
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.plot(fpr, tpr, color="#1f77b4", lw=2, label=f"AUC = {auc:.3f}")
+        ax.plot([0, 1], [0, 1], linestyle="--", color="#999999", lw=1, label="Chance")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("False positive rate")
+        ax.set_ylabel("True positive rate")
+        ax.set_title(f"{prefix.upper()} ROC")
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax.legend(loc="lower right")
+        fig.tight_layout()
+        fig.savefig(f"{out_dir}/{prefix}_roc_curve.png", dpi=200)
+        plt.close(fig)
     except ValueError:
         auc = float("nan")
     metrics[f"{prefix}_roc_auc"] = float(auc)
@@ -140,6 +154,21 @@ def _binary_ranking_metrics(y_true: np.ndarray,
             "recall": pr_r,
             "threshold": thr_pad,
         }).to_csv(f"{out_dir}/{prefix}_pr_curve.csv", index=False)
+
+        base_rate = float(np.mean(y_true)) if len(y_true) > 0 else 0.0
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.step(pr_r, pr_p, where="post", color="#d62728", lw=2, label=f"AP = {ap:.3f}")
+        ax.hlines(base_rate, 0, 1, colors="#999999", linestyles="--", lw=1, label=f"Baseline = {base_rate:.3f}")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1.05)
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.set_title(f"{prefix.upper()} Precision–Recall")
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax.legend(loc="lower left")
+        fig.tight_layout()
+        fig.savefig(f"{out_dir}/{prefix}_pr_curve.png", dpi=200)
+        plt.close(fig)
     except ValueError:
         ap = float("nan")
     metrics[f"{prefix}_avg_precision"] = float(ap)
@@ -165,8 +194,9 @@ def _km_by_risk_quantile(risk: np.ndarray,
 
     km = KaplanMeierFitter()
     rows = []
+    curves = []
     for g in sorted(np.unique(bins.dropna().astype(int))):
-        mask = bins == g
+        mask = (bins == g).to_numpy()
         if mask.sum() == 0:
             continue
         km.fit(t[mask], e[mask])
@@ -174,6 +204,12 @@ def _km_by_risk_quantile(risk: np.ndarray,
         surv.columns = ["time", "survival"]
         surv.to_csv(f"{out_dir}/{prefix}_km_q{g+1}.csv", index=False)
 
+        curves.append(
+            (
+                f"Q{g+1} (n={int(mask.sum())}, events={int(e[mask].sum())})",
+                surv,
+            )
+        )
         rows.append({
             "quantile": int(g + 1),
             "n": int(mask.sum()),
@@ -186,7 +222,30 @@ def _km_by_risk_quantile(risk: np.ndarray,
 
     summary = pd.DataFrame(rows)
     summary.to_csv(f"{out_dir}/{prefix}_km_summary.csv", index=False)
+    if curves:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        colors = plt.cm.viridis(np.linspace(0, 1, len(curves)))
+        for color, (label, surv) in zip(colors, curves):
+            ax.step(
+                surv["time"],
+                surv["survival"],
+                where="post",
+                lw=2,
+                color=color,
+                label=label,
+            )
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Survival probability")
+        ax.set_ylim(0, 1.05)
+        ax.set_title(f"{prefix.upper()} Kaplan–Meier by risk quantile")
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax.legend(title="Risk groups", loc="best")
+        fig.tight_layout()
+        fig.savefig(f"{out_dir}/{prefix}_km_plot.png", dpi=200)
+        plt.close(fig)
     return summary
+
+
 
 
 def train_val_test_split(X, t, e, test_size=0.3, seed=42):
@@ -1101,11 +1160,11 @@ def main():
     
             best_params = {
                 "layers": 3,
-                "width": 512,
-                "drop": 0.1,
+                "width": 2048,
+                "drop": 0.3,
                 "lr": 5e-3,
                 "wd": 1e-3,
-                "epochs": 50,
+                "epochs": 200,
             }
             best_cfg = best_params
             print("Best hyper-params:", best_cfg)
