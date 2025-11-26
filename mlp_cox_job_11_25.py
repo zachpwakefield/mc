@@ -1163,6 +1163,27 @@ def main():
     
         np.save(f"{model_dir}/risk_scores.npy", risk_test.numpy())
     
+        # additional discrimination / calibration summaries
+        y_dev = e_dev.detach().cpu().numpy().reshape(-1)
+        y_test = e_test.detach().cpu().numpy().reshape(-1)
+        risk_dev_np = risk_dev.numpy().reshape(-1)
+        risk_test_np = risk_test.numpy().reshape(-1)
+
+        extra_metrics = {}
+        extra_metrics.update(
+            _binary_ranking_metrics(y_dev, risk_dev_np, "dev", model_dir)
+        )
+        extra_metrics.update(
+            _binary_ranking_metrics(y_test, risk_test_np, "test", model_dir)
+        )
+
+        km_dev = _km_by_risk_quantile(
+            risk_dev_np, t_dev.numpy(), y_dev, "dev", model_dir
+        )
+        km_test = _km_by_risk_quantile(
+            risk_test_np, t_test.numpy(), y_test, "test", model_dir
+        )
+
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         meta = {
             "timestamp" : stamp,
@@ -1170,6 +1191,8 @@ def main():
             "modality"  : args.modality,
             "dev_cidx"  : round(best_score_dev, 4),
             "test_cidx" : round(c_test, 4),
+            "dev_km_summary": km_dev.to_dict(orient="list"),
+            "test_km_summary": km_test.to_dict(orient="list"),
             "params"    : best_cfg,
             "model_pt"  : model_path,
             "feat_names": feat_names,
@@ -1200,6 +1223,10 @@ def main():
         out_dir = f"{ROOT_DIR}/shap/{args.cancer}/{args.modality}"
         os.makedirs(out_dir, exist_ok=True)
 
+
+        
+
+        
 
         # ------------------  SHAP ---------------------------------
         out_dir = f"{ROOT_DIR}/shap/{args.cancer}/{args.modality}"
