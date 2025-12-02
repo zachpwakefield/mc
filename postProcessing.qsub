@@ -1,0 +1,32 @@
+#!/bin/bash
+#PBS -N postprocess_mlp_cox
+#PBS -l select=1:ncpus=4:mem=8gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -o /projectnb2/evolution/zwakefield/tcga/cancer_learning/single_input/plots/postprocess_$PBS_JOBID.log
+
+set -euo pipefail
+
+RUNS_ROOT=${RUNS_ROOT:-/projectnb2/evolution/zwakefield/tcga/cancer_learning/single_input}
+PLOTS_ROOT=${PLOTS_ROOT:-/projectnb2/evolution/zwakefield/tcga/cancer_learning/single_input/plots}
+DIR_NAME=${DIR_NAME:-}
+RUN_DIR=${RUN_DIR:-}
+PLOTS_SUBDIR=${PLOTS_SUBDIR:-}
+
+mkdir -p "$PLOTS_ROOT"
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+CMD=(python "$SCRIPT_DIR/postProcessing.py" --runs-root "$RUNS_ROOT" --plots-root "$PLOTS_ROOT")
+
+if [ -n "$RUN_DIR" ]; then
+  CMD+=(--run-dir "$RUN_DIR")
+elif [ -n "$DIR_NAME" ]; then
+  CMD+=(--dir-name "$DIR_NAME")
+fi
+
+if [ -n "$PLOTS_SUBDIR" ]; then
+  CMD+=(--plots-subdir "$PLOTS_SUBDIR")
+fi
+
+echo "Running: ${CMD[*]}"
+"${CMD[@]}"

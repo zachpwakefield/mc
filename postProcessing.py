@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -45,16 +45,28 @@ def _load_metrics(models_dir: Path) -> pd.DataFrame:
             print(f"⚠️  Skipping unreadable file {metrics_file}: {exc}")
             continue
 
-        test_cidx = metrics.get("test_cidx")
+        def _float_or_none(key: str) -> Optional[float]:
+            val = metrics.get(key)
+            try:
+                return float(val) if val is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        test_cidx = _float_or_none("test_cidx")
+        test_roc_auc = _float_or_none("test_roc_auc")
+        test_avg_precision = _float_or_none("test_avg_precision")
+
         if test_cidx is None:
-            print(f"⚠️  No test_cidx in {metrics_file}")
+            print(f"⚠️  No usable test_cidx in {metrics_file}")
             continue
 
         records.append(
             {
                 "cancer": cancer,
                 "modality": modality,
-                "test_cidx": float(test_cidx),
+                "test_cidx": test_cidx,
+                "test_roc_auc": test_roc_auc,
+                "test_avg_precision": test_avg_precision,
                 "path": str(metrics_file),
             }
         )
@@ -106,6 +118,29 @@ def plot_by_modality(df: pd.DataFrame, plot_dir: Path) -> Path:
     return _save_fig(fig, plot_dir, "modality_summary")
 
 
+def plot_metric_by_modality(
+    df: pd.DataFrame, metric: str, title: str, ylabel: str, name: str, plot_dir: Path
+) -> Optional[Path]:
+    data = df.dropna(subset=[metric])
+    if data.empty:
+        print(f"⚠️  Skipping {metric} by modality; no values available")
+        return None
+
+    order = (
+        data.groupby("modality")[metric]
+        .median()
+        .sort_values(ascending=False)
+        .index
+    )
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.boxplot(data=data, x="modality", y=metric, order=order, ax=ax, linewidth=1)
+    ax.set(title=title, xlabel="Modality", ylabel=ylabel)
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    return _save_fig(fig, plot_dir, name)
+
+
 def plot_by_cancer(df: pd.DataFrame, plot_dir: Path) -> Path:
     order = (
         df.groupby("cancer")["test_cidx"]
@@ -130,6 +165,29 @@ def plot_by_cancer(df: pd.DataFrame, plot_dir: Path) -> Path:
     ax.tick_params(axis="x", rotation=90)
     fig.tight_layout()
     return _save_fig(fig, plot_dir, "cancer_summary")
+
+
+def plot_metric_by_cancer(
+    df: pd.DataFrame, metric: str, title: str, ylabel: str, name: str, plot_dir: Path
+) -> Optional[Path]:
+    data = df.dropna(subset=[metric])
+    if data.empty:
+        print(f"⚠️  Skipping {metric} by cancer; no values available")
+        return None
+
+    order = (
+        data.groupby("cancer")[metric]
+        .median()
+        .sort_values(ascending=False)
+        .index
+    )
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    sns.boxplot(data=data, x="cancer", y=metric, order=order, ax=ax, linewidth=1)
+    ax.set(title=title, xlabel="Cancer type", ylabel=ylabel)
+    ax.tick_params(axis="x", rotation=90)
+    fig.tight_layout()
+    return _save_fig(fig, plot_dir, name)
 
 
 def plot_winner_counts(df: pd.DataFrame, plot_dir: Path) -> Path:
@@ -208,22 +266,42 @@ def _parse_args() -> argparse.Namespace:
         help="Root directory that contains timestamped mlp_cox_job runs",
     )
     parser.add_argument(
+        "--dir-name",
+        type=str,
+        help="Directory name under --runs-root corresponding to the mlp_cox_job output to summarise",
+    )
+    parser.add_argument(
         "--run-dir",
         type=Path,
         help="Specific run directory to analyse; if omitted, the latest run under --runs-root is used",
     )
     parser.add_argument(
+        "--plots-root",
+        type=Path,
+        default=Path("/projectnb2/evolution/zwakefield/tcga/cancer_learning/single_input/plots"),
+        help="Absolute directory where plots will be written (run-specific subfolders will be created)",
+    )
+    parser.add_argument(
         "--plots-subdir",
         type=str,
-        default="plots",
-        help="Subdirectory (relative to the run dir) where plots are written",
+        default=None,
+        help="Optional subdirectory within the run-specific folder under --plots-root",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    run_dir = args.run_dir if args.run_dir else _find_latest_run(args.runs_root)
+    if args.run_dir and args.dir_name:
+        raise SystemExit("Specify either --run-dir or --dir-name, not both")
+
+    if args.run_dir:
+        run_dir = args.run_dir
+    elif args.dir_name:
+        run_dir = args.runs_root / args.dir_name
+    else:
+        run_dir = _find_latest_run(args.runs_root)
+
     if not run_dir.is_dir():
         raise RuntimeError(f"Run directory does not exist: {run_dir}")
 
@@ -231,7 +309,9 @@ def main() -> None:
     if not models_dir.is_dir():
         raise RuntimeError(f"Expected models directory under run dir: {models_dir}")
 
-    plot_dir = run_dir / args.plots_subdir
+    plot_dir = args.plots_root / run_dir.name
+    if args.plots_subdir:
+        plot_dir = plot_dir / args.plots_subdir
 
     df = _load_metrics(models_dir)
     print(
@@ -245,6 +325,38 @@ def main() -> None:
     plot_by_cancer(df, plot_dir)
     plot_winner_counts(df, plot_dir)
     plot_rank_summaries(df, plot_dir)
+    plot_metric_by_modality(
+        df,
+        metric="test_roc_auc",
+        title="Test ROC AUC across modalities (ordered by median)",
+        ylabel="Test ROC AUC",
+        name="modality_test_roc_auc",
+        plot_dir=plot_dir,
+    )
+    plot_metric_by_cancer(
+        df,
+        metric="test_roc_auc",
+        title="Test ROC AUC across cancer types (ordered by median)",
+        ylabel="Test ROC AUC",
+        name="cancer_test_roc_auc",
+        plot_dir=plot_dir,
+    )
+    plot_metric_by_modality(
+        df,
+        metric="test_avg_precision",
+        title="Test PR AUC across modalities (ordered by median)",
+        ylabel="Test average precision",
+        name="modality_test_pr_auc",
+        plot_dir=plot_dir,
+    )
+    plot_metric_by_cancer(
+        df,
+        metric="test_avg_precision",
+        title="Test PR AUC across cancer types (ordered by median)",
+        ylabel="Test average precision",
+        name="cancer_test_pr_auc",
+        plot_dir=plot_dir,
+    )
 
 
 if __name__ == "__main__":
