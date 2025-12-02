@@ -544,6 +544,112 @@ def load_omics(cancer_code: int,
             names,
             sample_ids)
 
+def save_data_summaries(
+    X: torch.Tensor,
+    t: torch.Tensor,
+    e: torch.Tensor,
+    feat_names: List[str],
+    out_dir: str,
+    sample_cap: int = 200_000,
+):
+    """
+    Persist quick-look plots that summarize the training data.
+
+    • Histogram of feature values (flattened, optionally downsampled)
+    • Box plots of feature values grouped by prefix (gex/clin/a5ss/etc.)
+    • Histograms of survival times and event/censor counts
+    """
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    rng = np.random.default_rng(SEED)
+
+    X_np = X.detach().cpu().numpy()
+    t_np = t.detach().cpu().numpy()
+    e_np = e.detach().cpu().numpy()
+
+    # --- overall feature histogram ----------------------------------------
+    flat = X_np.reshape(-1)
+    flat_sample = (
+        flat if flat.size <= sample_cap else rng.choice(flat, size=sample_cap, replace=False)
+    )
+
+    plt.figure(figsize=(7, 5))
+    plt.hist(flat_sample, bins=80, color="#4c72b0", alpha=0.85, edgecolor="white")
+    plt.xlabel("Feature value")
+    plt.ylabel("Count")
+    plt.title("Feature value distribution (sampled)")
+    plt.grid(True, linestyle="--", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{out_dir}/feature_values_hist.png", dpi=200)
+    plt.close()
+
+    # --- box plots per prefix ---------------------------------------------
+    prefix_to_idx: Dict[str, List[int]] = {}
+    for i, name in enumerate(feat_names):
+        prefix = name.split("::", 1)[0]
+        prefix_to_idx.setdefault(prefix, []).append(i)
+
+    prefix_samples = []
+    prefix_labels = []
+    stats = []
+    for prefix, idxs in prefix_to_idx.items():
+        vals = X_np[:, idxs].reshape(-1)
+        if vals.size == 0:
+            continue
+        sampled = vals if vals.size <= sample_cap else rng.choice(vals, size=sample_cap, replace=False)
+        prefix_samples.append(sampled)
+        prefix_labels.append(prefix)
+        stats.append(
+            {
+                "prefix": prefix,
+                "count": int(vals.size),
+                "mean": float(np.mean(vals)),
+                "std": float(np.std(vals)),
+                "min": float(np.min(vals)),
+                "max": float(np.max(vals)),
+            }
+        )
+
+    if prefix_samples:
+        plt.figure(figsize=(max(6, 1.5 * len(prefix_samples)), 6))
+        plt.boxplot(prefix_samples, labels=prefix_labels, showfliers=False)
+        plt.ylabel("Feature value")
+        plt.title("Feature distributions by prefix")
+        plt.xticks(rotation=30, ha="right")
+        plt.grid(True, axis="y", linestyle="--", alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f"{out_dir}/feature_prefix_boxplot.png", dpi=200)
+        plt.close()
+
+    if stats:
+        pd.DataFrame(stats).to_csv(f"{out_dir}/feature_prefix_stats.csv", index=False)
+
+    # --- survival target summaries ---------------------------------------
+    plt.figure(figsize=(7, 5))
+    plt.hist(t_np, bins=50, color="#dd8452", alpha=0.85, edgecolor="white")
+    plt.xlabel("OS time")
+    plt.ylabel("Count")
+    plt.title("Survival time distribution")
+    plt.grid(True, linestyle="--", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{out_dir}/survival_time_hist.png", dpi=200)
+    plt.close()
+
+    event_counts = {
+        "censored": int((e_np == 0).sum()),
+        "event": int((e_np == 1).sum()),
+    }
+    plt.figure(figsize=(5, 4))
+    plt.bar(list(event_counts.keys()), list(event_counts.values()), color="#55a868")
+    plt.ylabel("Count")
+    plt.title("Event vs censored")
+    plt.tight_layout()
+    plt.savefig(f"{out_dir}/event_counts.png", dpi=200)
+    plt.close()
+
+    pd.DataFrame([event_counts]).to_csv(f"{out_dir}/event_counts.csv", index=False)
+
 
 def _strat_labels(t: torch.Tensor, e: torch.Tensor, n_q: int = 4) -> np.ndarray:
     """
@@ -791,11 +897,11 @@ def train_once(
             weight_decay=cfg["wd"],
         )
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt, mode="min", factor=0.5, patience=5
+            opt, mode="min", factor=0.5, patience=cfg.get("plateau_patience", 5)
         )
 
         best_c = -np.inf
-        patience = 50
+        patience = cfg.get("patience", 10)
         stall = 0
 
         for ep in range(1, cfg["epochs"] + 1):
@@ -847,6 +953,8 @@ def objective(trial, X, t, e, feat_names, modality, transform_data):
     "lr" : trial.suggest_float("lr", 1e-5, 1e-3, log=True), 
     "wd" : trial.suggest_float("wd", 1e-6, 1e-3, log=True), 
     "epochs" : trial.suggest_categorical("epochs", [100, 200, 300, 400, 500, 750, 1000, 1250]), 
+    "patience": trial.suggest_categorical("patience", [5, 10, 20, 35]),
+    "plateau_patience": trial.suggest_categorical("plateau_patience", [3, 5, 7, 9])
     } 
     return train_once(X, t, e, feat_names, cfg, modality, transform_data)
 
@@ -887,7 +995,7 @@ def fit_full(
         weight_decay=cfg["wd"],
     )
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=0.5, patience=5
+        opt, mode="min", factor=0.5, patience=cfg.get("plateau_patience", 5)
     )
 
     # keep tensors on CPU here; we’ll move train/val splits to device below
@@ -961,7 +1069,7 @@ def fit_full(
     best_val_c = -float("inf")
     best_state = None
     stall      = 0
-    patience   = 50
+    patience = cfg.get("patience", 10)
 
     train_losses, val_losses = [], []
     train_cidxs, val_cidxs   = [], []
@@ -1172,7 +1280,7 @@ def main():
     p.add_argument("--cancer",     required=True,
                    help="TCGA short code e.g. BRCA")
     p.add_argument("--modality",   required=True,
-                   choices=["gex", *EVENT_KEYS, "ALL"])
+                   choices=["gex", *EVENT_KEYS])
     p.add_argument("--max_trials", type=int, default=30)
     p.add_argument("--with_clin", action="store_true",
                help="append stage, gender, race, dx code")
@@ -1224,9 +1332,12 @@ def main():
         else:
             X, t, e, feat_names, sample_ids = load_omics(cancer_code, 
                                                          args.modality, 
-                                                         with_clin=args.with_clin, 
+                                                         with_clin=args.with_clin,
                                                          transform_data = args.transform_data,
                                                          mad_number = args.mad_number)
+
+        summary_dir = f"{ROOT_DIR}/models"
+        save_data_summaries(X, t, e, feat_names, summary_dir)
         
     
         init_fs_layout(ROOT_DIR, args.cancer, args.modality)
