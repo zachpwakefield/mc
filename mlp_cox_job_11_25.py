@@ -43,9 +43,9 @@ from sklearn.metrics import (
 PRELOADED_DATA = None
 # ------------------------------  constants / paths
 EVENT_KEYS = ["afe","ale","hit","mxe","se","ri","a5ss","a3ss"]
-GEX_CSV   = "/projectnb2/evolution/zwakefield/tcga/cancer_learning/data/small_harmonized/gex.csv"
+GEX_CSV   = "/projectnb2/evolution/zwakefield/tcga/cancer_learning/data/harmonized/gex.csv"
 
-ARNAP_CSV  = {k: f"/projectnb2/evolution/zwakefield/tcga/cancer_learning/data/small_harmonized/{k}.csv"
+ARNAP_CSV  = {k: f"/projectnb2/evolution/zwakefield/tcga/cancer_learning/data/harmonized/{k}.csv"
               for k in EVENT_KEYS}
 CLIN_CSV   = "/projectnb2/evolution/zwakefield/tcga/cancer_learning/clinical/clinical_data.csv"
 
@@ -106,6 +106,7 @@ def apply_zscore_inplace(x: torch.Tensor, idx: torch.Tensor, mu, sigma):
     x[:, idx] = (x[:, idx] - mu) / sigma
 
 
+
 def _binary_ranking_metrics(y_true: np.ndarray,
                             scores: np.ndarray,
                             prefix: str,
@@ -147,13 +148,28 @@ def _binary_ranking_metrics(y_true: np.ndarray,
     try:
         ap = average_precision_score(y_true, scores)
         pr_p, pr_r, pr_thr = precision_recall_curve(y_true, scores)
+
         # precision_recall_curve returns thresholds of len(n_points - 1)
         thr_pad = np.concatenate([pr_thr, [np.nan]])
-        pd.DataFrame({
-            "precision": pr_p,
-            "recall": pr_r,
-            "threshold": thr_pad,
-        }).to_csv(f"{out_dir}/{prefix}_pr_curve.csv", index=False)
+
+        # Rarely, recall is not strictly sorted or contains duplicates,
+        # which can make the step plot backtrack. Sort by recall and keep
+        # the highest precision per recall level for a clean, monotonic
+        # curve.
+        pr_df = (
+            pd.DataFrame(
+                {"precision": pr_p, "recall": pr_r, "threshold": thr_pad}
+            )
+            .sort_values("recall", kind="mergesort")
+            .groupby("recall", as_index=False)
+            .agg({"precision": "max", "threshold": "first"})
+        )
+
+        pr_p = pr_df["precision"].to_numpy()
+        pr_r = pr_df["recall"].to_numpy()
+        thr_pad = pr_df["threshold"].to_numpy()
+
+        pr_df.to_csv(f"{out_dir}/{prefix}_pr_curve.csv", index=False)
 
         base_rate = float(np.mean(y_true)) if len(y_true) > 0 else 0.0
         fig, ax = plt.subplots(figsize=(6, 5))
@@ -246,7 +262,88 @@ def _km_by_risk_quantile(risk: np.ndarray,
     return summary
 
 
+def _risk_distribution_plots(
+    risk: np.ndarray,
+    e: np.ndarray,
+    prefix: str,
+    out_dir: str,
+    q: int = 4,
+) -> pd.DataFrame:
+    """
+    Save publication-ready risk distributions and event-rate barplots.
 
+    Returns a per-quantile summary table with counts, events, and rates.
+    """
+    df = pd.DataFrame({"risk": risk, "event": e})
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Histogram: event vs censored
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    bins = np.histogram_bin_edges(risk, bins=30)
+    ax.hist(
+        df.loc[df["event"] == 1, "risk"],
+        bins=bins,
+        alpha=0.65,
+        color="#d62728",
+        label="Event",
+        density=True,
+    )
+    ax.hist(
+        df.loc[df["event"] == 0, "risk"],
+        bins=bins,
+        alpha=0.65,
+        color="#1f77b4",
+        label="Censored",
+        density=True,
+    )
+    ax.set_xlabel("Risk score")
+    ax.set_ylabel("Density")
+    ax.set_title(f"{prefix.upper()} risk distribution")
+    ax.grid(True, linestyle="--", alpha=0.35)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(f"{out_dir}/{prefix}_risk_hist.png", dpi=200)
+    plt.close(fig)
+
+    # Event rate by quantile
+    try:
+        bins = pd.qcut(df["risk"], q=q, labels=False, duplicates="drop")
+    except ValueError:
+        bins = pd.cut(df["risk"], bins=q, labels=False)
+
+    df["quantile"] = bins
+    grouped = (
+        df.dropna(subset=["quantile"])
+        .groupby("quantile")
+        .agg(
+            n=("risk", "size"),
+            events=("event", "sum"),
+            risk_min=("risk", "min"),
+            risk_max=("risk", "max"),
+            risk_mean=("risk", "mean"),
+        )
+    )
+    grouped["event_rate"] = grouped["events"] / grouped["n"].clip(lower=1)
+    grouped.index = grouped.index.astype(int) + 1  # 1-based for readability
+    grouped.to_csv(f"{out_dir}/{prefix}_risk_quantiles.csv")
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    ax.bar(grouped.index.astype(str), grouped["event_rate"], color="#9467bd", alpha=0.85)
+    ax.set_xlabel("Risk quantile")
+    ax.set_ylabel("Event rate")
+    ax.set_ylim(0, max(0.05, grouped["event_rate"].max() * 1.2))
+    ax.set_title(f"{prefix.upper()} event rate by risk quantile")
+    for idx, rate in grouped["event_rate"].items():
+        ax.text(idx - 1, rate + 0.01, f"{rate:.2f}", ha="center", va="bottom", fontsize=8)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+    fig.tight_layout()
+    fig.savefig(f"{out_dir}/{prefix}_risk_quantiles.png", dpi=200)
+    plt.close(fig)
+
+    grouped.reset_index(inplace=True)
+    grouped.rename(columns={"index": "quantile"}, inplace=True)
+    grouped["quantile"] = grouped["quantile"].astype(int)
+    return grouped
 
 def train_val_test_split(X, t, e, test_size=0.3, seed=42):
     """
@@ -296,10 +393,44 @@ def _append_status(project: str, modality: str, status: str) -> None:
         tmp.replace(path)
 
 
+def filter_by_mad(df: pd.DataFrame,
+                  feat_names:  List[str],
+                  mad_number: int):
+    """
+    Filter features by top MAD values and save CSV.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Feature matrix (samples × features).
+    feat_names : List[str]
+        names of the features
+    mad_number : int
+        Number of top-MAD features to keep.
+    """
+
+    if isinstance(df, np.ndarray):
+        df = pd.DataFrame(df, columns=feat_names)
+
+    # 1 — compute MAD for each feature
+    mad = np.median(np.abs(df - np.median(df, axis=0)), axis=0)
+    mad = pd.Series(mad, index=df.columns)
+
+    # 2 — sort MAD descending and pick top N
+    top_feats = mad.sort_values(ascending=False).head(mad_number).index
+
+    names = top_feats.tolist()
+    print(df.shape[1])
+    # 3 — subset dataframe
+    df_filt = df[top_feats]
+
+    return df_filt.values.astype(np.float32), names
+
 def load_omics(cancer_code: int,
                modality: str,
                with_clin: bool,
-               transform_data: bool) \
+               transform_data: bool,
+               mad_number: int) \
         -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
 
     # -------- clinical table -----------------
@@ -337,23 +468,11 @@ def load_omics(cancer_code: int,
     print(X.shape)
 
     X = np.nan_to_num(X, nan=0.0)
-    
-    # if transform_data:
-    #     X = apply_transform(X, select_transform(modality))
-    #     TOP_K_EVENTS = 1000
-    #     mod_lower = modality.lower()
-
-    #     # Only do this for splicing event modalities, not for gex
-    #     if mod_lower in EVENT_KEYS and X.shape[1] > TOP_K_EVENTS:
-    #         # variance per feature (across samples)
-    #         var = X.var(axis=0)            # shape (n_features,)
-    #         # indices of top-K by variance, high → low
-    #         top_idx = np.argsort(var)[::-1][:TOP_K_EVENTS]
-
-    #         X     = X[:, top_idx]
-    #         names = [names[i] for i in top_idx]
-    #         print(f"[FEATURE SELECT] modality={modality}, "
-    #             f"keeping {TOP_K_EVENTS} / {len(var)} highest-variance events")
+    X, names = filter_by_mad(
+        df=X,
+        feat_names=names,
+        mad_number=mad_number
+    )
 
     if with_clin:
         clin_frames, clin_names = [], []
@@ -385,6 +504,7 @@ def load_omics(cancer_code: int,
             X = np.hstack([X] + clin_frames)
             names += clin_names
 
+    
     # -------- targets ------------------------
     t = clin["OS.time"].values.astype(np.float32)
     e = clin["OS.event"].values.astype(np.float32)
@@ -393,7 +513,31 @@ def load_omics(cancer_code: int,
     keep = (~np.isnan(X).any(1)) & ~np.isnan(t) & ~np.isnan(e)
     X, t, e = X[keep], t[keep], e[keep]
 
+
+    
+    out_root = "/projectnb2/evolution/zwakefield/tcga/cancer_learning/data/mad_harmonized"
+    cancer_type = clin["Project.ID"].unique()[0]
+    # 4 — output path
+    out_path = f"{out_root}/{cancer_type}_{modality}_{mad_number}.csv"
+
+    # ensure directory exists
+    os.makedirs(out_root, exist_ok=True)
+
+    # get filtered sample ids
     sample_ids = clin.index.values[keep]
+
+    # 5 — save
+    Xout = pd.DataFrame(X, index=sample_ids)
+    print("Xout.shape:", Xout.shape)
+    print("len(names):", len(names))
+    Xout.columns = names
+    Xout.index.name = "sample_id"
+    Xout.to_csv(out_path)
+
+    print(f"[INFO] Saved MAD-filtered matrix ({X.shape[0]} features) → {out_path}")
+
+
+    
     return (torch.tensor(X, dtype=torch.float32),
             torch.tensor(t, dtype=torch.float32),
             torch.tensor(e, dtype=torch.float32),
@@ -595,7 +739,7 @@ def train_once(
     cfg: dict,
     modality: str,
     transform_data: bool = True,
-    folds: int = 5,
+    folds: int = 3,
     seed: int = SEED
 ) -> float:
     """
@@ -656,7 +800,7 @@ def train_once(
         )
 
         best_c = -np.inf
-        patience = 100
+        patience = 50
         stall = 0
 
         for ep in range(1, cfg["epochs"] + 1):
@@ -670,7 +814,7 @@ def train_once(
                 return float("-inf")
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=20.0)
             opt.step()
 
             # ---------------------- val ------------------------
@@ -679,12 +823,12 @@ def train_once(
                 risk_val = net(X_va_d)
                 loss_val = cox_ph_loss(risk_val, t_va_d, e_va_d)
 
-            # C-index on CPU
-            c_val = concordance_index(
-                t[va].detach().cpu().numpy(),
-                -risk_val.detach().cpu().numpy(),
-                e[va].detach().cpu().numpy(),
-            )
+                # C-index on CPU
+                c_val = concordance_index(
+                    t[va].detach().cpu().numpy(),
+                    -risk_val.detach().cpu().numpy(),
+                    e[va].detach().cpu().numpy(),
+                )
 
             if c_val > best_c:
                 best_c = c_val
@@ -692,7 +836,7 @@ def train_once(
             else:
                 stall += 1
 
-            sched.step(-c_val)
+            sched.step(loss_val.item())
             if stall >= patience:
                 break
 
@@ -701,17 +845,26 @@ def train_once(
     return float(np.mean(cidx_scores))
 
 
-def objective(trial, X, t, e, feat_names, modality, transform_data):
-    cfg = {
-        "layers" : trial.suggest_int("layers", 2, 8),
-        "width"  : trial.suggest_categorical("width", [4096, 2048, 1024, 512, 256, 128]),
-        "drop"   : trial.suggest_float("drop", 0.1, 0.8),
-        "lr"     : trial.suggest_float("lr", 1e-5, 1e-3, log=True),
-        "wd"     : trial.suggest_float("wd", 1e-6, 1e-3, log=True),
-        "epochs" : trial.suggest_categorical("epochs", [100, 200, 300, 400, 500, 750, 1000, 1250]),
-    }
-    return train_once(X, t, e, feat_names, cfg, modality, transform_data)
+# def objective(trial, X, t, e, feat_names, modality, transform_data):
+#     cfg = {
+#         "layers" : trial.suggest_int("layers", 2, 6),
+#         "width"  : trial.suggest_categorical("width", [2048, 1024, 512, 256, 128]),
+#         "drop"   : trial.suggest_float("drop", 0.1, 0.6),
+#         "lr"     : trial.suggest_float("lr", 1e-5, 1e-3, log=True),
+#         "wd"     : trial.suggest_float("wd", 1e-6, 1e-3, log=True),
+#         "epochs" : trial.suggest_categorical("epochs", [100, 200, 300, 400, 500, 750]),
+#     }
+#     return train_once(X, t, e, feat_names, cfg, modality, transform_data)
 
+def objective(trial, X, t, e, feat_names, modality, transform_data): 
+    cfg = { "layers" : trial.suggest_int("layers", 2, 8), 
+    "width" : trial.suggest_categorical("width", [4096, 2048, 1024, 512, 256, 128]), 
+    "drop" : trial.suggest_float("drop", 0.1, 0.8), 
+    "lr" : trial.suggest_float("lr", 1e-5, 1e-3, log=True), 
+    "wd" : trial.suggest_float("wd", 1e-6, 1e-3, log=True), 
+    "epochs" : trial.suggest_categorical("epochs", [100, 200, 300, 400, 500, 750, 1000, 1250]), 
+    } 
+    return train_once(X, t, e, feat_names, cfg, modality, transform_data)
 
 
 def fit_full(
@@ -1048,6 +1201,7 @@ def main():
     p.add_argument("--use_preloaded", action="store_true",
                help="If set, expect PRELOADED_DATA tuple in mlp_cox_job namespace")
     p.add_argument("--dir_name", default = 'none')
+    p.add_argument("--mad_number", type=int, default = 25000)
     args = p.parse_args()
 
     global DEVICE, ROOT_DIR, STATUS_CSV
@@ -1088,7 +1242,11 @@ def main():
             X, t, e, feat_names, sample_ids = PRELOADED_DATA
             print("[INFO] Using tensors from PRELOADED_DATA")
         else:
-            X, t, e, feat_names, sample_ids = load_omics(cancer_code, args.modality, with_clin=args.with_clin, transform_data = args.transform_data)
+            X, t, e, feat_names, sample_ids = load_omics(cancer_code, 
+                                                         args.modality, 
+                                                         with_clin=args.with_clin, 
+                                                         transform_data = args.transform_data,
+                                                         mad_number = args.mad_number)
             
         
     
@@ -1154,18 +1312,18 @@ def main():
     
         else:
             best_score_dev = 1
-            # best_params=optuna.load_study(study_name=study_name,
-            #                               storage=storage
-            #                               ).best_params
+            best_params=optuna.load_study(study_name=study_name,
+                                          storage=storage
+                                          ).best_params
     
-            best_params = {
-                "layers": 3,
-                "width": 2048,
-                "drop": 0.3,
-                "lr": 5e-3,
-                "wd": 1e-3,
-                "epochs": 200,
-            }
+            # best_params = {
+            #     "layers": 4,
+            #     "width": 1024,
+            #     "drop": 0.3,
+            #     "lr": 5e-3,
+            #     "wd": 1e-3,
+            #     "epochs": 200,
+            # }
             best_cfg = best_params
             print("Best hyper-params:", best_cfg)
     
@@ -1236,6 +1394,11 @@ def main():
             _binary_ranking_metrics(y_test, risk_test_np, "test", model_dir)
         )
 
+        risk_q_dev = _risk_distribution_plots(risk_dev_np, y_dev, "dev", model_dir)
+        risk_q_test = _risk_distribution_plots(
+            risk_test_np, y_test, "test", model_dir
+        )
+
         km_dev = _km_by_risk_quantile(
             risk_dev_np, t_dev.numpy(), y_dev, "dev", model_dir
         )
@@ -1254,6 +1417,7 @@ def main():
             "test_km_summary": km_test.to_dict(orient="list"),
             "params"    : best_cfg,
             "model_pt"  : model_path,
+            **extra_metrics,
             "feat_names": feat_names,
             "non_clin_idx": non_clin_idx.detach().cpu().numpy().tolist(),
             "mu"        : mu.detach().cpu().numpy().tolist(),
