@@ -5,7 +5,7 @@ Train an MLP-Cox model on one (cancer, modality) pair.
 
 Usage
 -----
-python mlp_cox_job.py --cancer BRCA --modality AFE \
+python mlp_cox_job.py --cancer BRCA --modality afe \
                       --max_trials 20 --gpus 1
 Valid --modality:  gex | afe | ale | hit | mxe | se | ri | a5ss | a3ss
 """
@@ -457,7 +457,6 @@ def load_omics(cancer_code: int,
                else [modality] if modality in EVENT_KEYS else []
     for k in arp_keys:
         df = _read_matrix(ARNAP_CSV[k])[clin.index].T
-        # df = _logit_clip(df, 1e-3)
         if df.empty:
             continue
         mats.append(df)
@@ -468,6 +467,7 @@ def load_omics(cancer_code: int,
     print(X.shape)
 
     X = np.nan_to_num(X, nan=0.0)
+    X = apply_transform(X, select_transform(modality))
     X, names = filter_by_mad(
         df=X,
         feat_names=names,
@@ -752,12 +752,7 @@ def train_once(
     skf = StratifiedKFold(folds, shuffle=True, random_state=seed)
 
     # indices of features to z-score (non-clin OR clin::age)
-    non_clin_idx = torch.tensor(
-        [i for i, n in enumerate(feat_names)
-         if (not n.startswith("clin::")) or (n == "clin::age")],
-        dtype=torch.long,
-        device=X.device,
-    )
+    non_clin_idx = get_non_clin_idx(feat_names)
 
     cidx_scores: List[float] = []
     idxs = np.arange(len(X))
@@ -845,21 +840,10 @@ def train_once(
     return float(np.mean(cidx_scores))
 
 
-# def objective(trial, X, t, e, feat_names, modality, transform_data):
-#     cfg = {
-#         "layers" : trial.suggest_int("layers", 2, 6),
-#         "width"  : trial.suggest_categorical("width", [2048, 1024, 512, 256, 128]),
-#         "drop"   : trial.suggest_float("drop", 0.1, 0.6),
-#         "lr"     : trial.suggest_float("lr", 1e-5, 1e-3, log=True),
-#         "wd"     : trial.suggest_float("wd", 1e-6, 1e-3, log=True),
-#         "epochs" : trial.suggest_categorical("epochs", [100, 200, 300, 400, 500, 750]),
-#     }
-#     return train_once(X, t, e, feat_names, cfg, modality, transform_data)
-
 def objective(trial, X, t, e, feat_names, modality, transform_data): 
-    cfg = { "layers" : trial.suggest_int("layers", 2, 8), 
-    "width" : trial.suggest_categorical("width", [4096, 2048, 1024, 512, 256, 128]), 
-    "drop" : trial.suggest_float("drop", 0.1, 0.8), 
+    cfg = { "layers" : trial.suggest_int("layers", 2, 6), 
+    "width" : trial.suggest_categorical("width", [2048, 1024, 512, 256, 128]), 
+    "drop" : trial.suggest_float("drop", 0.1, 0.6), 
     "lr" : trial.suggest_float("lr", 1e-5, 1e-3, log=True), 
     "wd" : trial.suggest_float("wd", 1e-6, 1e-3, log=True), 
     "epochs" : trial.suggest_categorical("epochs", [100, 200, 300, 400, 500, 750, 1000, 1250]), 
@@ -926,11 +910,7 @@ def fit_full(
     val_idx   = torch.from_numpy(val_idx_np)
 
     # --- compute z-score stats on non-clinical + age (CPU) -----------------
-    non_clin_idx_cpu = torch.tensor(
-        [i for i, name in enumerate(feat_names)
-         if (not name.startswith("clin::")) or (name == "clin::age")],
-        dtype=torch.long,
-    )
+    non_clin_idx_cpu = get_non_clin_idx(feat_names)
 
     # stats on TRAIN subset only
     mu_cpu, sigma_cpu = fit_zscore(X_cpu[train_idx][:, non_clin_idx_cpu])
@@ -981,7 +961,7 @@ def fit_full(
     best_val_c = -float("inf")
     best_state = None
     stall      = 0
-    patience   = 100
+    patience   = 50
 
     train_losses, val_losses = [], []
     train_cidxs, val_cidxs   = [], []
@@ -1247,7 +1227,6 @@ def main():
                                                          with_clin=args.with_clin, 
                                                          transform_data = args.transform_data,
                                                          mad_number = args.mad_number)
-            
         
     
         init_fs_layout(ROOT_DIR, args.cancer, args.modality)
