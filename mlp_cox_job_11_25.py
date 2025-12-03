@@ -1381,7 +1381,7 @@ def main():
     )
     p.add_argument(
         "--filter_num",
-        type=int,
+        type=float,
         default=15,
         help="If filter_mode='unique', keep features with >unique_thresh unique values."
     )
