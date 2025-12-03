@@ -60,3 +60,18 @@ python mlp_cox_job_11_25.py --cancer BRCA --modality gex --max_trials 20 --with_
 ```
 
 The command will create a timestamped run directory under the configured base path, populate it with all artifacts listed above, and produce ready-to-use figures and tables for reporting without needing to regenerate metrics.
+
+### Comparing multiple runs
+Use `compare_runs.py` to summarise and plot side-by-side performance for several completed runs. Example:
+
+```bash
+python compare_runs.py \
+  --run-dirs \
+    /projectnb2/evolution/zwakefield/tcga/cancer_learning/single_input/model_outputs_12_1_mad10000 \
+    /projectnb2/evolution/zwakefield/tcga/cancer_learning/single_input/model_outputs_12_1_unique10 \
+    /projectnb2/evolution/zwakefield/tcga/cancer_learning/single_input/model_outputs_12_1_nonzero10 \
+  --run-labels mad10000 unique10 nonzero10 \
+  --plot-dir ./plots/comparisons
+```
+
+Outputs include overall C-index distributions, per-cancer boxplots (one box per run per cancer), and per-cancer win counts to make it clear which configuration performs best overall and by cancer type.
