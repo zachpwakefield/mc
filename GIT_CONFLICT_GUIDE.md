@@ -38,6 +38,13 @@ You choose one, the other, or a blend based on which version should survive in t
 - **Prefer clarity:** If both sides are valid, merge them into the clearest combined version.
 - **If unsure, test both:** Temporarily keep one side, run tests; if failing, try the other or combine.
 
+### What if I'm the only person changing the repo?
+If you are the only contributor (e.g., Codex is the only one making edits) and you hit a conflict, pick the side that matches the branch you intend to keep:
+
+- **Merging a PR into main:** The PR's edits are the *incoming* changes. Keep incoming to accept the PR as-is, unless you've made local fixes on main that need to remain—then manually merge the differences.
+- **Merging main into your feature branch:** Main is the incoming side. Keep incoming when you want main's latest to override your branch, or manually merge if you need to preserve your branch's tweaks.
+- **Rule of thumb:** "Incoming" is always the branch you're pulling in; "Current" is your checked-out branch. Choose the side that matches the branch whose behavior you want after the merge.
+
 ## See also
 - `git checkout --theirs <file>` keeps the incoming version.
 - `git checkout --ours <file>` keeps the current version.
