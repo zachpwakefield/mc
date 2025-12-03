@@ -426,12 +426,86 @@ def filter_by_mad(df: pd.DataFrame,
 
     return df_filt.values.astype(np.float32), names
 
+
+def filter_by_unique(df: pd.DataFrame,
+                     feat_names: List[str],
+                     uniq_thresh: int):
+    """
+    Keep features that have more than `uniq_thresh` unique values.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Feature matrix (samples × features).
+    feat_names : List[str]
+        names of the features (same order as df columns)
+    uniq_thresh : int
+        Minimum number of unique values required to keep the feature.
+    """
+
+    # Convert to DataFrame if ndarray
+    if isinstance(df, np.ndarray):
+        df = pd.DataFrame(df, columns=feat_names)
+
+    # compute unique values per feature
+    uniq_counts = df.nunique(axis=0)
+
+    # mask of kept features
+    keep_feats = uniq_counts[uniq_counts > uniq_thresh].index
+
+    # subset
+    df_filt = df[keep_feats]
+
+    # output names in correct order
+    names = df_filt.columns.tolist()
+
+    print(f"[INFO] Unique-value filtering kept {len(names)} / {df.shape[1]} features.")
+
+    return df_filt.values.astype(np.float32), names
+
+def filter_by_nonzero(df: pd.DataFrame,
+                      feat_names: List[str],
+                      nz_thresh: int):
+    """
+    Keep features that have at least `nz_thresh` non-zero values.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Feature matrix (samples × features).
+    feat_names : List[str]
+        Column names
+    nz_thresh : int
+        Minimum number of non-zero samples required to keep the feature.
+    """
+
+    # Convert ndarray to DataFrame
+    if isinstance(df, np.ndarray):
+        df = pd.DataFrame(df, columns=feat_names)
+
+    # count non-zero values per feature
+    nz_counts = (df != 0).sum(axis=0)
+    print(nz_counts.value_counts())
+    # features to keep
+    keep_feats = nz_counts[nz_counts >= nz_thresh].index
+
+    # subset
+    df_filt = df[keep_feats]
+
+    # output names
+    names = df_filt.columns.tolist()
+
+    print(f"[INFO] Non-zero filtering kept {len(names)} / {df.shape[1]} features.")
+
+    return df_filt.values.astype(np.float32), names
+
+
 def load_omics(cancer_code: int,
                modality: str,
                with_clin: bool,
                transform_data: bool,
-               mad_number: int) \
-        -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
+               filter_mode: str,
+               filter_num: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
 
     # -------- clinical table -----------------
     clin = pd.read_csv(CLIN_CSV)
@@ -467,12 +541,21 @@ def load_omics(cancer_code: int,
     print(X.shape)
 
     X = np.nan_to_num(X, nan=0.0)
-    X = apply_transform(X, select_transform(modality))
-    X, names = filter_by_mad(
-        df=X,
-        feat_names=names,
-        mad_number=mad_number
-    )
+    
+    if filter_mode == "mad":
+        X = apply_transform(X, select_transform(modality))
+        X, names = filter_by_mad(X, names, filter_num)
+    elif filter_mode == "unique_vals":
+        X, names = filter_by_unique(X, names, filter_num)
+        X = apply_transform(X, select_transform(modality))
+    elif filter_mode == "nonzero_vals":
+        nz_thresh = int(filter_num * clin.shape[0])
+        print(f"[INFO] Using non-zero threshold = {nz_thresh} "
+            f"({filter_num} × {clin.shape[0]} samples)")
+        X, names = filter_by_nonzero(X, names, nz_thresh)
+        X = apply_transform(X, select_transform(modality))
+    else:
+        raise ValueError(f"Unknown filter_mode: {filter_mode}")
 
     if with_clin:
         clin_frames, clin_names = [], []
@@ -515,10 +598,10 @@ def load_omics(cancer_code: int,
 
 
     
-    out_root = "/projectnb2/evolution/zwakefield/tcga/cancer_learning/data/mad_harmonized"
+    out_root = f"/projectnb2/evolution/zwakefield/tcga/cancer_learning/data/{filter_mode}_harmonized"
     cancer_type = clin["Project.ID"].unique()[0]
     # 4 — output path
-    out_path = f"{out_root}/{cancer_type}_{modality}_{mad_number}.csv"
+    out_path = f"{out_root}/{cancer_type}_{modality}_{filter_num}.csv"
 
     # ensure directory exists
     os.makedirs(out_root, exist_ok=True)
@@ -534,7 +617,7 @@ def load_omics(cancer_code: int,
     Xout.index.name = "sample_id"
     Xout.to_csv(out_path)
 
-    print(f"[INFO] Saved MAD-filtered matrix ({X.shape[0]} features) → {out_path}")
+    print(f"[INFO] Saved {filter_mode}-filtered matrix ({X.shape[0]} features) → {out_path}")
 
 
     
@@ -953,8 +1036,8 @@ def objective(trial, X, t, e, feat_names, modality, transform_data):
     "lr" : trial.suggest_float("lr", 1e-5, 1e-3, log=True), 
     "wd" : trial.suggest_float("wd", 1e-6, 1e-3, log=True), 
     "epochs" : trial.suggest_categorical("epochs", [100, 200, 300, 400, 500, 750, 1000, 1250]), 
-    "patience": trial.suggest_categorical("patience", [5, 10, 20, 35]),
-    "plateau_patience": trial.suggest_categorical("plateau_patience", [3, 5, 7, 9])
+    "patience": trial.suggest_categorical("patience", [5, 20, 35]),
+    "plateau_patience": trial.suggest_categorical("plateau_patience", [3, 6, 9])
     } 
     return train_once(X, t, e, feat_names, cfg, modality, transform_data)
 
@@ -1289,7 +1372,19 @@ def main():
     p.add_argument("--use_preloaded", action="store_true",
                help="If set, expect PRELOADED_DATA tuple in mlp_cox_job namespace")
     p.add_argument("--dir_name", default = 'none')
-    p.add_argument("--mad_number", type=int, default = 25000)
+    p.add_argument(
+        "--filter_mode",
+        type=str,
+        default="mad",
+        choices=["mad", "unique_vals", "nonzero_vals"],
+        help="Feature filtering: 'mad' selects top MAD features, 'unique' selects features with >N unique values."
+    )
+    p.add_argument(
+        "--filter_num",
+        type=int,
+        default=15,
+        help="If filter_mode='unique', keep features with >unique_thresh unique values."
+    )
     args = p.parse_args()
 
     global DEVICE, ROOT_DIR, STATUS_CSV
@@ -1334,7 +1429,8 @@ def main():
                                                          args.modality, 
                                                          with_clin=args.with_clin,
                                                          transform_data = args.transform_data,
-                                                         mad_number = args.mad_number)
+                                                         filter_mode = args.filter_mode,
+                                                         filter_num = args.filter_num)
 
         summary_dir = f"{ROOT_DIR}/models"
         save_data_summaries(X, t, e, feat_names, summary_dir)
